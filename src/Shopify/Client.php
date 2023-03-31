@@ -4,6 +4,7 @@ namespace Shopify;
 
 use GuzzleHttp;
 use Psr\Http\Message\ResponseInterface;
+require 'libs\RateLimiter.vaidll'; //Ajout MV
 
 /**
  * Class Client
@@ -36,7 +37,6 @@ abstract class Client {
     'page_info',
     'limit',
     'fields',
-    '_apiFeatures',
   ];
 
   /**
@@ -82,7 +82,7 @@ abstract class Client {
    *
    * @var bool
    */
-  protected $delay_next_call = FALSE;
+  protected static $delay_next_call = FALSE;
 
 
   /**
@@ -211,10 +211,10 @@ abstract class Client {
 
     $opts['headers'] = array_merge($opts['headers'], $this->default_headers);
 
-    if ($this->rate_limit && $this->delay_next_call) {
+    if ($this->rate_limit && self::$delay_next_call) {
       // Sleep a random amount of time to help prevent bucket overflow.
       usleep(rand(3, 10) * 1000000);
-    }
+    }   
 
     if (isset($opts['query']['page_info'])) {
       // Only some params allowed when page_info isset, so we should remove the other.
@@ -225,21 +225,26 @@ abstract class Client {
       // Log a warning if the page parameter is used.
       trigger_error('The "page" query parameter is no longer supported in the Shopify API.', E_USER_WARNING);
     }
+    
+    //Ajout MV
+    if (!isset($this->RateLimiter)) {
+        $this->RateLimiter = new \RateLimiter(2);
+    }
+    $this->RateLimiter->wait();
 
     try {
       $this->last_response = $this->client->request($method, $resource . '.json', $opts);
+      
+      //Ajout MV        
+      $this->RateLimiter->action();
 
       // Add the paginated response.
       if (strtoupper($method) === 'GET') {
         $this->paginated_response = new PaginatedResponse($this, $resource, $opts);
       }
     } catch (GuzzleHttp\Exception\RequestException $e) {
-
       $this->last_response = $e->getResponse();
       if (!empty($this->last_response)) {
-
-        $this->handleScopeException($e);
-
         $this->has_errors = TRUE;
         $this->errors = $this->getResponseJsonObjectKey($this->last_response, 'errors');
         throw new ClientException(print_r($this->errors, TRUE), $this->last_response->getStatusCode(), $e, $this);
@@ -247,7 +252,6 @@ abstract class Client {
       else {
         throw new ClientException('Request failed (' . $this->shop_domain . ':' . $method . ':' . $resource . '):' . print_r($opts, TRUE), 0, $e, $this);
       }
-
     }
 
     $this->has_errors = FALSE;
@@ -256,30 +260,13 @@ abstract class Client {
     $this->setCallLimitParams();
 
     if ($this->callLimitReached()) {
-      $this->delay_next_call = TRUE;
+      self::$delay_next_call = TRUE;
     }
     else {
-      $this->delay_next_call = FALSE;
+      self::$delay_next_call = FALSE;
     }
 
     return $this->last_response;
-  }
-
-  /**
-   * Handle a missing scope exception.
-   *
-   * @param \GuzzleHttp\Exception\RequestException $e
-   *
-   * @throws \Shopify\ShopifyMissingScopesException
-   */
-  private function handleScopeException(GuzzleHttp\Exception\RequestException $e) {
-    if (stripos($e->getMessage(), 'requires merchant approval') !== FALSE) {
-      $message = strstr(strstr($e->getMessage(), '[API]'), ' scope.', TRUE);
-      $missing_scope = str_replace('[API] This action requires merchant approval for ', '', $message);
-      if (!(empty($missing_scope))) {
-        throw new ShopifyMissingScopesException('Missing required scope', $e->getCode(), $e, $this, [$missing_scope]);
-      }
-    }
   }
 
   /**
@@ -576,15 +563,6 @@ abstract class Client {
   }
 
   /**
-   * Get the current API version being used by the Client.
-   *
-   * @return string
-   */
-  public function getAPIVersion() {
-    return $this->version;
-  }
-
-  /**
    * Builds the API URL from the client settings.
    *
    * @return string
@@ -667,32 +645,19 @@ abstract class Client {
    * @return \Generator
    */
   public function getResourcePager($resource, $limit = NULL, array $opts = []) {
-    if (isset($opts['query']['limit'])) {
-      $fetch_total = $opts['query']['limit'];
-    }
-
     if (!isset($opts['query']['limit'])) {
       $opts['query']['limit'] = ($limit ?: $this->default_limit);
-    }
-
-    if ($opts['query']['limit'] > 250) {
-      // If we are trying to fetch more than 250 items we need to make multiple requests
-      // and not return more than what the original limit was.
-      $opts['query']['limit'] = 250;
     }
 
     // Get the first page of results.
     $result = $this->get($resource, $opts);
 
-    $returned_count = 0;
-
     while (!empty($result)) {
       foreach (get_object_vars($result) as $resource_name => $results) {
-        if (empty($results) || (isset($fetch_total) && $returned_count >= $fetch_total)) {
+        if (empty($results)) {
           return;
         }
         foreach ($results as $object) {
-          $returned_count++;
           yield $object;
         }
       }
